@@ -1,140 +1,208 @@
 use serenity::all::Mentionable;
 use songbird::input::Compose;
 
-type Command = poise::Command<crate::Data, anyhow::Error>;
-type Context<'a> = poise::Context<'a, crate::Data, anyhow::Error>;
+use crate::utils::{msg_err, reg_err, say_error, say_text};
 
-pub fn all_commands() -> Vec<Command> {
+pub fn all_commands() -> Vec<crate::Command> {
     vec![play(), stop()]
-}
-
-fn checked<T>(result: serenity::Result<T>) {
-    if let Err(err) = result {
-        eprintln!("{:?}", err);
-    }
 }
 
 #[poise::command(slash_command, guild_only)]
 async fn play(
-    ctx: Context<'_>,
-    #[description = "URL/Query to play"] input: String,
+    ctx: crate::Context<'_>,
+    #[description = "URL/Query to play"] track: String,
 ) -> anyhow::Result<()> {
-    let (gid, maybe_vcid) = {
-        let guild = ctx.guild().ok_or(anyhow::anyhow!("No guild"))?;
-        let maybe_vcid = guild
-            .voice_states
-            .get(&ctx.author().id)
-            .and_then(|state| state.channel_id);
-        (guild.id, maybe_vcid)
-    };
-    let vcid = match maybe_vcid {
-        Some(c) => c,
-        None => {
-            checked(ctx.reply("Join a voice channel to use this command").await);
-            return Ok(());
-        }
-    };
+    msg_err!(ctx.defer().await);
+    let (gid, vcid) = reg_err!(ctx, get_gid_and_user_vcid(ctx));
+    let call_lock = reg_err!(ctx, join_if_disconnected(ctx, gid, vcid).await);
 
-    let manager = ctx.data().songbird.clone();
-
-    let maybe_call_lock = match manager.get(gid) {
-        Some(cl) if cl.lock().await.current_connection().is_some() => Some(cl),
-        _ => {
-            checked(ctx.say(format!("Joining {}", vcid.mention())).await);
-            manager.join(gid, vcid).await.ok()
-        }
-    };
-    let call_lock = match maybe_call_lock {
-        Some(cl) => cl,
-        None => {
-            checked(ctx.reply(format!("Failed to join the channel")).await);
-            return Ok(());
-        }
-    };
-
-    let mut call = call_lock.lock().await;
-    if let Some(cid) = call
-        .current_connection()
-        .and_then(|conn| conn.channel_id)
-        .map(|c| serenity::all::ChannelId::from(c.0))
-        && cid != vcid
-    {
-        checked(
-            ctx.reply(format!("Already connected to {}", cid.mention()))
-                .await,
-        );
+    if track.starts_with("https://") || track.starts_with("http://") {
+        reg_err!(ctx, add_track(ctx, call_lock, track).await);
         return Ok(());
     }
 
-    let is_url = input.starts_with("https://") || input.starts_with("http://");
-    let mut src = if is_url {
-        songbird::input::YoutubeDl::new(ctx.data().http.clone(), input)
-    } else {
-        songbird::input::YoutubeDl::new_search(ctx.data().http.clone(), input)
+    let mut src = songbird::input::YoutubeDl::new_search(ctx.data().http.clone(), track);
+    let res = reg_err!(ctx, src.search(Some(10)).await, "No songs found");
+    let res: Vec<(String, String, u64)> = res
+        .filter_map(|meta| Some((meta.title?, meta.source_url?, meta.duration?.as_secs())))
+        .collect();
+    let desc: Vec<_> = res
+        .iter()
+        .enumerate()
+        .map(|(i, (title, url, secs))| {
+            format!(
+                "{}: [**{}**]({}) - {:02}:{:02}",
+                i + 1,
+                title,
+                url,
+                secs / 60,
+                secs % 60
+            )
+        })
+        .collect();
+    let options: Vec<_> = res
+        .iter()
+        .enumerate()
+        .map(|(i, (title, url, _))| {
+            let mut label = format!("{}: {}", i + 1, title);
+            let len = (0..=100).rfind(|&i| label.is_char_boundary(i)).unwrap_or(0);
+            label.truncate(len);
+            serenity::all::CreateSelectMenuOption::new(label, url)
+        })
+        .collect();
+    let msg = poise::CreateReply::default()
+        .embed(
+            serenity::all::CreateEmbed::default()
+                .title("Search Results")
+                .description(desc.join("\n")),
+        )
+        .components(vec![serenity::all::CreateActionRow::SelectMenu(
+            serenity::all::CreateSelectMenu::new(
+                "track",
+                serenity::all::CreateSelectMenuKind::String { options },
+            ),
+        )])
+        .ephemeral(true);
+
+    let reply = msg_err!(ctx.send(msg).await);
+    let msg = msg_err!(reply.message().await);
+    let inter = match msg
+        .await_component_interaction(&ctx.serenity_context().shard)
+        .timeout(std::time::Duration::from_secs(60))
+        .await
+    {
+        Some(x) => x,
+        None => {
+            msg_err!(reply.delete(ctx).await);
+            say_error(ctx, "Timed out").await;
+            return Ok(());
+        }
     };
-    let mut ret_str = String::from("Playing song");
-    if let Ok(data) = src.aux_metadata().await {
-        data.title
-            .inspect(|title| ret_str.push_str(&format!(": {}", title)));
-        data.artist
-            .inspect(|artist| ret_str.push_str(&format!(" by {}", artist)));
-        data.duration.inspect(|duration| {
-            let seconds = duration.as_secs();
-            ret_str.push_str(&format!(" - {}:{}", seconds / 60, seconds % 60));
-        });
-    }
-    checked(ctx.reply(ret_str).await);
+    msg_err!(reply.delete(ctx).await);
+    let url = match &inter.data.kind {
+        serenity::all::ComponentInteractionDataKind::StringSelect { values } => &values[0],
+        _ => {
+            say_error(ctx, "Unknown data kind. How did this happen?").await;
+            return Ok(());
+        }
+    };
 
-    // TODO: replace with queue system
-    call.stop();
-    call.play_input(src.into());
-
+    reg_err!(ctx, add_track(ctx, call_lock, url).await);
     Ok(())
 }
 
 #[poise::command(slash_command, guild_only)]
-async fn stop(ctx: Context<'_>) -> anyhow::Result<()> {
-    let (gid, maybe_vcid) = {
-        let guild = ctx.guild().ok_or(anyhow::anyhow!("No guild"))?;
-        let maybe_vcid = guild
-            .voice_states
-            .get(&ctx.author().id)
-            .and_then(|state| state.channel_id);
-        (guild.id, maybe_vcid)
-    };
-    let vcid = match maybe_vcid {
-        Some(c) => c,
-        None => {
-            checked(ctx.reply("Join a voice channel to use this command").await);
-            return Ok(());
-        }
-    };
-
+async fn stop(ctx: crate::Context<'_>) -> anyhow::Result<()> {
+    let (gid, vcid) = reg_err!(ctx, get_gid_and_user_vcid(ctx));
     let manager = ctx.data().songbird.clone();
     let call_lock = match manager.get(gid) {
         Some(cl) if cl.lock().await.current_connection().is_some() => cl,
         _ => {
-            checked(ctx.reply("Nothing to stop").await);
+            say_error(ctx, "Nothing to stop").await;
             return Ok(());
         }
     };
 
     let mut call = call_lock.lock().await;
-    let cid = call
-        .current_connection()
-        .and_then(|conn| conn.channel_id)
-        .map(|c| serenity::all::ChannelId::from(c.0))
-        .ok_or(anyhow::anyhow!("No channel"))?;
+    let cid = reg_err!(
+        ctx,
+        call.current_connection()
+            .and_then(|conn| conn.channel_id)
+            .ok_or(anyhow::anyhow!("No channel. How did this happen?"))
+    );
+    let cid = serenity::all::ChannelId::from(cid.0);
 
     if cid != vcid {
-        checked(ctx.reply("Join my voice channel to use this command").await);
+        say_error(ctx, "Join my voice channel to use this command").await;
         return Ok(());
     }
 
-    checked(
-        ctx.reply(format!("Stopped and disconnected from {}", cid.mention()))
-            .await,
+    call.queue().stop();
+    reg_err!(ctx, call.leave().await, "Failed to leave the call.");
+
+    say_text(
+        ctx,
+        format!("Stopped and disconnected from {}", cid.mention()),
+    )
+    .await;
+    Ok(())
+}
+
+async fn join_if_disconnected(
+    ctx: crate::Context<'_>,
+    gid: serenity::all::GuildId,
+    cid: serenity::all::ChannelId,
+) -> anyhow::Result<std::sync::Arc<tokio::sync::Mutex<songbird::Call>>> {
+    let manager = ctx.data().songbird.clone();
+    let maybe_call_lock = match manager.get(gid) {
+        Some(cl) if cl.lock().await.current_connection().is_some() => Some(cl),
+        _ => manager.join(gid, cid).await.ok(),
+    };
+    let call_lock = maybe_call_lock.ok_or(anyhow::anyhow!("Failed to join the channel"))?;
+    let maybe_current_cid = call_lock
+        .lock()
+        .await
+        .current_connection()
+        .and_then(|conn| conn.channel_id)
+        .map(|c| serenity::all::ChannelId::from(c.0));
+    match maybe_current_cid {
+        Some(current_cid) if current_cid != cid => {
+            anyhow::bail!(format!("Already connected to {}", current_cid.mention()))
+        }
+        None => anyhow::bail!("Failed to join the channel"),
+        _ => Ok(call_lock),
+    }
+}
+
+fn get_gid_and_user_vcid(
+    ctx: crate::Context<'_>,
+) -> anyhow::Result<(serenity::all::GuildId, serenity::all::ChannelId)> {
+    let guild = ctx
+        .guild()
+        .ok_or(anyhow::anyhow!("No guild. How did this happen?"))?;
+    let gid = guild.id.clone();
+    let vcid = guild
+        .voice_states
+        .get(&ctx.author().id)
+        .and_then(|state| state.channel_id)
+        .ok_or(anyhow::anyhow!("Join a voice channel to use this command"))?
+        .clone();
+    Ok((gid, vcid))
+}
+
+async fn add_track(
+    ctx: crate::Context<'_>,
+    call_lock: std::sync::Arc<tokio::sync::Mutex<songbird::Call>>,
+    url: impl Into<String>,
+) -> anyhow::Result<()> {
+    let mut call = call_lock.lock().await;
+    let mut src = songbird::input::YoutubeDl::new(ctx.data().http.clone(), url.into());
+    let (title, url, duration, thumb) = src
+        .aux_metadata()
+        .await
+        .ok()
+        .and_then(|m| Some((m.title?, m.source_url?, m.duration?.as_secs(), m.thumbnail?)))
+        .ok_or(anyhow::anyhow!("Failed to fetch track info"))?;
+    call.enqueue_input(src.into()).await;
+    let msg = poise::CreateReply::default().embed(
+        serenity::all::CreateEmbed::default()
+            .title("Added Track")
+            .description(format!(
+                "[**{}**]({}) - {:02}:{:02}",
+                title,
+                url,
+                duration / 60,
+                duration % 60
+            ))
+            .footer(
+                serenity::all::CreateEmbedFooter::new(ctx.author().display_name())
+                    .icon_url(ctx.author().static_face()),
+            )
+            .image(thumb)
+            .color(serenity::all::colours::branding::GREEN),
     );
-    call.leave().await?;
+    if let Err(err) = ctx.send(msg).await {
+        eprintln!("{:?}", err);
+    }
     Ok(())
 }

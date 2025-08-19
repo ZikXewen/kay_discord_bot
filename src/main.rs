@@ -1,4 +1,5 @@
 mod commands;
+mod utils;
 
 use poise::serenity_prelude as serenity;
 
@@ -6,6 +7,9 @@ struct Data {
     http: reqwest::Client,
     songbird: std::sync::Arc<songbird::Songbird>,
 }
+
+type Command = poise::Command<Data, anyhow::Error>;
+type Context<'a> = poise::Context<'a, Data, anyhow::Error>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
