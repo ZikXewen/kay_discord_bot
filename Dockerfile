@@ -17,7 +17,7 @@ RUN cargo build --release
 
 ####################################
 
-FROM debian:bookworm-slim AS runner
+FROM debian:stable-slim AS runner
 
 RUN apt update && \
     apt install -y curl && \
