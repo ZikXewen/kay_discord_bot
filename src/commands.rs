@@ -4,7 +4,7 @@ use songbird::input::Compose;
 use crate::utils::{msg_err, reg_err, say_error, say_text};
 
 pub fn all_commands() -> Vec<crate::Command> {
-    vec![play(), stop()]
+    vec![play(), stop(), skip()]
 }
 
 #[poise::command(slash_command, guild_only)]
@@ -91,40 +91,38 @@ async fn play(
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only)]
+#[poise::command(slash_command, guild_only, aliases("leave"))]
 async fn stop(ctx: crate::Context<'_>) -> anyhow::Result<()> {
-    let (gid, vcid) = reg_err!(ctx, get_gid_and_user_vcid(ctx));
-    let manager = ctx.data().songbird.clone();
-    let call_lock = match manager.get(gid) {
-        Some(cl) if cl.lock().await.current_connection().is_some() => cl,
-        _ => {
-            say_error(ctx, "Nothing to stop").await;
-            return Ok(());
-        }
-    };
-
-    let mut call = call_lock.lock().await;
-    let cid = reg_err!(
+    let (gid, vcid) = reg_err!(ctx, get_gid_and_match_vcid(ctx).await);
+    let maybe_call_lock = ctx.data().songbird.clone().get(gid);
+    let call_lock = reg_err!(
         ctx,
-        call.current_connection()
-            .and_then(|conn| conn.channel_id)
-            .ok_or(anyhow::anyhow!("No channel. How did this happen?"))
+        maybe_call_lock.ok_or(anyhow::anyhow!("Not connected to any channel"))
     );
-    let cid = serenity::all::ChannelId::from(cid.0);
-
-    if cid != vcid {
-        say_error(ctx, "Join my voice channel to use this command").await;
-        return Ok(());
-    }
+    let mut call = call_lock.lock().await;
 
     call.queue().stop();
     reg_err!(ctx, call.leave().await, "Failed to leave the call.");
-
     say_text(
         ctx,
-        format!("Stopped and disconnected from {}", cid.mention()),
+        format!("Stopped and disconnected from {}", vcid.mention()),
     )
     .await;
+    Ok(())
+}
+
+#[poise::command(slash_command, guild_only)]
+async fn skip(ctx: crate::Context<'_>) -> anyhow::Result<()> {
+    let (gid, _) = reg_err!(ctx, get_gid_and_match_vcid(ctx).await);
+    let maybe_call_lock = ctx.data().songbird.clone().get(gid);
+    let call_lock = reg_err!(
+        ctx,
+        maybe_call_lock.ok_or(anyhow::anyhow!("Not connected to any channel"))
+    );
+    let call = call_lock.lock().await;
+
+    reg_err!(ctx, call.queue().skip(), "Failed to skip");
+    say_text(ctx, "Skipped").await;
     Ok(())
 }
 
@@ -168,6 +166,29 @@ fn get_gid_and_user_vcid(
         .ok_or(anyhow::anyhow!("Join a voice channel to use this command"))?
         .clone();
     Ok((gid, vcid))
+}
+
+async fn get_gid_and_match_vcid(
+    ctx: crate::Context<'_>,
+) -> anyhow::Result<(serenity::all::GuildId, serenity::all::ChannelId)> {
+    let (gid, ucid) = get_gid_and_user_vcid(ctx)?;
+    let bcid: serenity::all::ChannelId = ctx
+        .data()
+        .songbird
+        .clone()
+        .get(gid)
+        .ok_or(anyhow::anyhow!("Not connected to any channel"))?
+        .lock()
+        .await
+        .current_connection()
+        .and_then(|conn| conn.channel_id)
+        .ok_or(anyhow::anyhow!("Not connected to any channel"))?
+        .0
+        .into();
+    if ucid != bcid {
+        anyhow::bail!("Join my voice channel to use this command");
+    }
+    Ok((gid, ucid))
 }
 
 async fn add_track(
