@@ -121,8 +121,6 @@ async fn add_track(
     let meta = std::sync::Arc::new(meta);
     let track = songbird::tracks::Track::new_with_data(src.into(), meta.clone());
     call.enqueue(track).await;
-    if let Err(err) = ctx.send(meta.clone().to_embed(ctx)).await {
-        eprintln!("{:?}", err);
-    }
+    msg_err!(ctx.send(meta.clone().to_embed(ctx, "Added Track")).await);
     Ok(())
 }

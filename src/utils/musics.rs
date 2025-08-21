@@ -6,10 +6,10 @@ pub struct TrackMeta {
 }
 
 impl TrackMeta {
-    pub fn to_embed(&self, ctx: crate::Context<'_>) -> poise::CreateReply {
+    pub fn to_embed(&self, ctx: crate::Context<'_>, title: &'static str) -> poise::CreateReply {
         poise::CreateReply::default().embed(
             serenity::all::CreateEmbed::default()
-                .title("Added Track")
+                .title(title)
                 .description(self.to_string())
                 .footer(
                     serenity::all::CreateEmbedFooter::new(ctx.author().display_name())
