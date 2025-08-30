@@ -1,9 +1,7 @@
-name: kay
-
 services:
   main:
-    build: .
+    container_name: kay_discord_bot_prod
+    image: ghcr.io/zikxewen/kay_discord_bot:master
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
     restart: unless-stopped
-
