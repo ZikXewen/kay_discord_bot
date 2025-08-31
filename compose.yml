@@ -1,6 +1,7 @@
 services:
   main:
     build: .
+    image: ghcr.io/zikxewen/kay_discord_bot:master
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
     restart: unless-stopped
