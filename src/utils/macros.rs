@@ -11,7 +11,8 @@ macro_rules! reg_err {
     ($ctx: ident, $x: expr, $err: expr) => {
         match $x {
             Ok(val) => val,
-            Err(_) => {
+            Err(err) => {
+                dbg!(err);
                 crate::utils::replies::say_error($ctx, $err).await;
                 return Ok(());
             }

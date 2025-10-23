@@ -116,7 +116,10 @@ async fn add_track(
     let meta: TrackMeta = src
         .aux_metadata()
         .await
-        .map_err(|_| anyhow::anyhow!("Failed to fetch track info"))?
+        .map_err(|e| {
+            dbg!(e);
+            anyhow::anyhow!("Failed to fetch track info")
+        })?
         .try_into()?;
     let meta = std::sync::Arc::new(meta);
     let track = songbird::tracks::Track::new_with_data(src.into(), meta.clone());
